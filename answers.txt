@@ -1,0 +1,55 @@
+1. How do you verify that the image you built in your local build system is the same one being served to users?
+
+I verified the image using content addressed digests. For a single platform image, I would compare the digests produced locally and by the registry and for a multi architecture one, I would verify the top level OCI index digest, and might also go with the platform specific manifest digests underneath if necessary.
+In this assessment, I published an immutable Git commit SHA tag and a mutable tag "latest" in the pipeline, the published multi architecture image currently resolves to sha256:91ae2ead70d429a7542cc6ecebbf2004f143fe09be08e88156e83381b9c6cb1a and the registry index contains separate manifests for linux/amd64 and linux/arm64. For a prod level product, I would also recommend recording the pushed digest as a build output and deploy by digest instead of tag, treating it as the fundamental integrity check by comparison. We could also add image signing and provenance verification if required.
+
+
+2. What would change if you were publishing the same image for multiple architectures?
+
+First off, the image cannot be manifested on a single platform, I would build one image per target platform and publish them under a common OCI image index list. I built linux/amd64 and linux/arm64 for this assessment and both platform images contain an architecture specific HelloWorld binary, libc runtime and dynamic loader because the ABI and filesystem paths differ between the two platforms.
+The Dockerfile thus selects the correct runtime based on TARGETARCH and the resulting registry tag points to an OCI index containing separate amd64 and arm64 manifests which are then pulled by a compatible client. In this case, while building on an amd64 CI runner, QEMU ended up providing emulation for arm64 build steps that needed execution but for larger builds I would recommend native builders they avoid emulation overhead.
+
+
+3. Please describe a CI/CD pipeline that takes a GitHub repository with the C "Hello World" source code, and then builds and publishes a multi-architecture "Hello World" container image as an output, reusing the Dockerfile from step 1.
+
+I went with a pipeline that is essentially a Git Actions workflow that is triggered either by a push to main or manually. Below is the timeline
+
+1. Check out the repository.
+2. Set up QEMU for cross architecture execution.
+3. Set up Docker Buildx.
+4. Authenticate to Docker Hub using repository secrets.
+5. Build the same Dockerfile for linux/amd64 and linux/arm64.
+6. Push both platform images as a single multi architecture image.
+7. Publish the following:
+   - an immutable Git SHA tag
+   - a convenience "latest" tag
+
+The core build step is equivalent to:
+
+docker buildx build \
+  --platform linux/amd64,linux/arm64 \
+  -t <registry>/canonical-hello:<git-sha> \
+  -t <registry>/canonical-hello:latest \
+  --push .
+
+I was able to execute the workflow and verify the published image using
+
+docker buildx imagetools inspect oneeyedk1ng/canonical-hello:latest
+
+The resulting OCI index contained both linux/amd64 and linux/arm64 manifests.
+
+For a prod pipeline I would monitor third party actions more strictly and retain the published digest as a deployed artifact. Potentially I could also add provenance/SBOM depending upon what the requirements are.
+
+
+4. Suppose you want to squash the layers in the image you built in the previous steps. What would be the advantages and disadvantages? Would you recommend squashing the resultant image and why? Finally, if your container image had a layer with a file called "myfile", and the subsequent layer had another file called ".wh.myfile", what would happen to both files after you squash your container image?
+
+Squashing helps with combining multiple layers into a smaller number of layers, ideally a single filesystem layer. 
+Its advantages include the ability to remove data that was added in an earlier layer and deleted layer, it can also reduce image size when layers contain temporary files, it also produces a simpler final layer structure and can hide the implementation details from the final layer history. It may be used to eliminate whiteout overhead as well.
+The disadvantages include losing out on layer reuse across related images, slower pulls, loss of useful build information, it can also make auditing and forensic analysis harder and may increase the amount of data transferred when only a small layer is changed. Also in some cases the sensitive data may still exist somewhere else in the caches or registrations.
+
+For this image, I would not recommend squashing.
+
+Because the problem statement required the final image to start FROM scratch, it only copies the minimal runtime filesystem and HelloWorld to the final stage and since there are no packet managers there is very little intermediate layers to eliminate. Therefore squashing this image doesn't provide any practical benefits.
+".wh.myfile" is a whiteout marker used by layered container filesystems that basically means that "myfile" was present in a previous layer but was deleted.
+Before squashing, an earlier layer contains "myfile" and a later layer contains ".wh.myfile", which makes "myfile" appear deleted in the merged filesystem. After squashing,"myfile" doesn't exist and neither does ".wh.myfile"
+The whiteout is basically metadata, once the layers are flattened its gone and so is the deleted file.
